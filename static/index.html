@@ -306,6 +306,104 @@
     display: none;
   }
   .geo-result.visible { display: block; }
+
+  /* Tracker panel */
+  .tracker-panel {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+    margin: 12px 20px;
+  }
+  .tracker-panel h3 {
+    font-size: 14px;
+    color: #f0f6fc;
+    margin-bottom: 4px;
+  }
+  .tracker-panel .subtitle {
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 12px;
+  }
+  .tracker-form {
+    display: flex;
+    gap: 8px;
+    align-items: end;
+    flex-wrap: wrap;
+  }
+  .tracker-form .field { display: flex; flex-direction: column; gap: 2px; }
+  .tracker-form .field label { font-size: 10px; color: #8b949e; }
+  .tracker-form .field input {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    width: 120px;
+  }
+  .tracker-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .tracker-status {
+    margin-top: 12px;
+    font-size: 12px;
+    line-height: 1.8;
+    padding: 10px;
+    background: #0d1117;
+    border-radius: 6px;
+    border: 1px solid #21262d;
+    display: none;
+  }
+  .tracker-status.visible { display: block; }
+  .tracker-progress {
+    height: 4px;
+    background: #21262d;
+    border-radius: 2px;
+    margin-bottom: 8px;
+    overflow: hidden;
+  }
+  .tracker-progress-bar {
+    height: 100%;
+    background: #58a6ff;
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+  .confidence-box {
+    margin-top: 10px;
+    padding: 10px;
+    background: #23863622;
+    border: 1px solid #23863666;
+    border-radius: 6px;
+  }
+  .confidence-box .big-num {
+    font-size: 22px;
+    font-weight: 700;
+    color: #3fb950;
+  }
+  .round-entry {
+    padding: 6px 0;
+    border-bottom: 1px solid #21262d;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    font-size: 11px;
+  }
+  .round-entry:last-child { border-bottom: none; }
+  .round-num {
+    color: #8b949e;
+    min-width: 50px;
+  }
+  .round-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 4px;
+  }
 </style>
 </head>
 <body>
@@ -395,6 +493,56 @@
     <button class="btn-secondary" onclick="loadDemo()" style="margin-left:auto;">Load Live Ping Data</button>
   </div>
   <div class="geo-result" id="geoResult"></div>
+</div>
+
+<div class="tracker-panel" id="trackerPanel">
+  <h3>MEO Ship Tracker — Time-Series Geolocation</h3>
+  <div class="subtitle">Track an O3b/MEO ship IP over time. Each ping round draws a slant range circle from a different satellite position. As circles accumulate, their intersection narrows to a confidence region showing the ship's estimated location.</div>
+  <div class="tracker-form">
+    <div class="field">
+      <label>Ship IP Address</label>
+      <input type="text" id="trackIP" value="185.6.111.132" placeholder="e.g. 185.6.111.132">
+    </div>
+    <div class="field">
+      <label>Interval (sec)</label>
+      <input type="number" id="trackInterval" value="60" step="30" min="30">
+    </div>
+    <div class="field">
+      <label>Rounds</label>
+      <input type="number" id="trackRounds" value="6" min="2" max="24">
+    </div>
+    <div class="field">
+      <label>Pings/round</label>
+      <input type="number" id="trackPings" value="20" min="5" max="100">
+    </div>
+    <div class="field">
+      <label>Ground delay (ms)</label>
+      <input type="number" id="trackGround" value="5" step="1">
+    </div>
+    <div class="field">
+      <label>Teleport Lat</label>
+      <input type="number" id="trackTpLat" value="49.68" step="0.01">
+    </div>
+    <div class="field">
+      <label>Teleport Lon</label>
+      <input type="number" id="trackTpLon" value="6.33" step="0.01">
+    </div>
+  </div>
+  <div class="tracker-buttons">
+    <button class="btn-primary" id="trackStartBtn" onclick="startTracking()">Start Tracking</button>
+    <button class="btn-danger" id="trackStopBtn" onclick="stopTracking()" style="display:none;">Stop</button>
+    <button class="btn-secondary" id="trackClearBtn" onclick="clearTracking()">Clear</button>
+  </div>
+  <div class="tracker-status" id="trackerStatus">
+    <div class="tracker-progress"><div class="tracker-progress-bar" id="trackerProgressBar" style="width:0%"></div></div>
+    <div id="trackerStatusText"></div>
+    <div id="trackerRounds"></div>
+    <div class="confidence-box" id="confidenceBox" style="display:none;">
+      <div>Confidence Region</div>
+      <div class="big-num" id="confidenceRadius">--</div>
+      <div id="confidenceDetails" style="font-size:11px;color:#8b949e;margin-top:4px;"></div>
+    </div>
+  </div>
 </div>
 
 <div class="table-header">
@@ -1063,6 +1211,227 @@ function drawGeoCirclesDemo(circles) {
   if (geoCircles.length > 0) {
     const group = L.featureGroup(geoCircles);
     map.fitBounds(group.getBounds().pad(0.1));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MEO Ship Tracker — time-series geolocation
+// ---------------------------------------------------------------------------
+let activeTrackId = null;
+let trackPollTimer = null;
+let trackCircleLayers = [];   // accumulating circle polylines
+let trackConfidenceLayer = null;  // confidence region polygon
+let trackCenterMarker = null;
+
+const trackCircleColors = [
+  '#58a6ff', '#3fb950', '#f0883e', '#d2a8ff', '#f778ba', '#ffa657',
+  '#79c0ff', '#56d364', '#ffa198', '#e3b341', '#bc8cff', '#ff9bce',
+];
+
+async function startTracking() {
+  const ip = document.getElementById('trackIP').value.trim();
+  if (!ip) return;
+
+  const req = {
+    ip: ip,
+    interval_sec: parseInt(document.getElementById('trackInterval').value) || 60,
+    n_rounds: parseInt(document.getElementById('trackRounds').value) || 6,
+    pings_per_round: parseInt(document.getElementById('trackPings').value) || 20,
+    ground_delay_ms: parseFloat(document.getElementById('trackGround').value) || 5,
+    teleport_lat: parseFloat(document.getElementById('trackTpLat').value) || 49.68,
+    teleport_lon: parseFloat(document.getElementById('trackTpLon').value) || 6.33,
+  };
+
+  try {
+    const resp = await fetch('/api/track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    });
+    const data = await resp.json();
+    activeTrackId = data.track_id;
+
+    // Update UI
+    document.getElementById('trackStartBtn').style.display = 'none';
+    document.getElementById('trackStopBtn').style.display = 'inline-block';
+    document.getElementById('trackerStatus').classList.add('visible');
+    document.getElementById('trackerStatusText').innerHTML =
+      `<span style="color:#58a6ff;">Tracking started</span> — ${ip} | ${req.n_rounds} rounds @ ${req.interval_sec}s intervals`;
+
+    // Start polling
+    pollTracking();
+    trackPollTimer = setInterval(pollTracking, 3000);
+  } catch(e) {
+    console.error('Failed to start tracking:', e);
+    document.getElementById('trackerStatusText').innerHTML =
+      `<span style="color:#f85149;">Failed to start: ${e.message}</span>`;
+    document.getElementById('trackerStatus').classList.add('visible');
+  }
+}
+
+async function stopTracking() {
+  if (!activeTrackId) return;
+  try {
+    await fetch(`/api/track/${activeTrackId}/stop`, { method: 'POST' });
+    document.getElementById('trackStopBtn').style.display = 'none';
+    document.getElementById('trackStartBtn').style.display = 'inline-block';
+  } catch(e) {
+    console.error('Failed to stop:', e);
+  }
+}
+
+function clearTracking() {
+  // Stop polling
+  if (trackPollTimer) { clearInterval(trackPollTimer); trackPollTimer = null; }
+  activeTrackId = null;
+
+  // Remove map layers
+  trackCircleLayers.forEach(l => map.removeLayer(l));
+  trackCircleLayers = [];
+  if (trackConfidenceLayer) { map.removeLayer(trackConfidenceLayer); trackConfidenceLayer = null; }
+  if (trackCenterMarker) { map.removeLayer(trackCenterMarker); trackCenterMarker = null; }
+
+  // Reset UI
+  document.getElementById('trackStartBtn').style.display = 'inline-block';
+  document.getElementById('trackStopBtn').style.display = 'none';
+  document.getElementById('trackerStatus').classList.remove('visible');
+  document.getElementById('trackerStatusText').innerHTML = '';
+  document.getElementById('trackerRounds').innerHTML = '';
+  document.getElementById('confidenceBox').style.display = 'none';
+  document.getElementById('trackerProgressBar').style.width = '0%';
+}
+
+async function pollTracking() {
+  if (!activeTrackId) return;
+  try {
+    const resp = await fetch(`/api/track/${activeTrackId}`);
+    const data = await resp.json();
+    updateTrackingUI(data);
+
+    if (data.status === 'complete' || data.status === 'stopped') {
+      clearInterval(trackPollTimer);
+      trackPollTimer = null;
+      document.getElementById('trackStopBtn').style.display = 'none';
+      document.getElementById('trackStartBtn').style.display = 'inline-block';
+    }
+  } catch(e) {
+    console.error('Poll error:', e);
+  }
+}
+
+function updateTrackingUI(data) {
+  const nRounds = data.n_rounds;
+  const completed = data.completed_rounds;
+  const pct = Math.round((completed / nRounds) * 100);
+
+  // Progress bar
+  document.getElementById('trackerProgressBar').style.width = pct + '%';
+
+  // Status text
+  let statusHTML = `<span style="color:#58a6ff;">${data.status}</span>`;
+  statusHTML += ` — ${completed}/${nRounds} rounds | IP: ${data.ip}`;
+  document.getElementById('trackerStatusText').innerHTML = statusHTML;
+
+  // Round entries
+  let roundsHTML = '';
+  data.measurements.forEach((m, i) => {
+    const color = trackCircleColors[i % trackCircleColors.length];
+    if (m.error) {
+      roundsHTML += `<div class="round-entry">
+        <span class="round-num">Round ${m.round}</span>
+        <span style="color:#f85149;">${m.error}</span>
+      </div>`;
+    } else {
+      const satName = m.satellite || 'unknown';
+      const range = m.ship_range_km ? m.ship_range_km.toLocaleString() + ' km' : '--';
+      roundsHTML += `<div class="round-entry">
+        <span class="round-num">Round ${m.round}</span>
+        <span class="round-dot" style="background:${color}"></span>
+        <span>${satName}</span>
+        <span style="color:#8b949e;">RTT: ${m.min_rtt_ms}ms</span>
+        <span style="color:#8b949e;">Range: ${range}</span>
+        <span style="color:#8b949e;">${new Date(m.time).toUTCString().slice(17, 25)} UTC</span>
+      </div>`;
+    }
+  });
+  document.getElementById('trackerRounds').innerHTML = roundsHTML;
+
+  // Draw circles on map (redraw all each poll to keep in sync)
+  trackCircleLayers.forEach(l => map.removeLayer(l));
+  trackCircleLayers = [];
+
+  if (data.circles && data.circles.length > 0) {
+    data.circles.forEach((c, i) => {
+      const color = trackCircleColors[i % trackCircleColors.length];
+
+      // Range circle
+      if (c.circle && c.circle.length > 0) {
+        const latlngs = c.circle.map(p => [p[0], p[1]]);
+        const poly = L.polyline(latlngs, {
+          color: color, weight: 2, opacity: 0.75,
+        }).addTo(map);
+        trackCircleLayers.push(poly);
+      }
+
+      // Satellite marker at time of measurement
+      if (c.satellite) {
+        const sm = L.circleMarker([c.satellite.lat, c.satellite.lon], {
+          radius: 4, color: color, fillColor: color, fillOpacity: 0.8, weight: 1,
+        }).addTo(map).bindTooltip(`${c.name} (R${i+1})`, { direction: 'top' });
+        trackCircleLayers.push(sm);
+      }
+    });
+  }
+
+  // Confidence region
+  if (trackConfidenceLayer) { map.removeLayer(trackConfidenceLayer); trackConfidenceLayer = null; }
+  if (trackCenterMarker) { map.removeLayer(trackCenterMarker); trackCenterMarker = null; }
+
+  if (data.confidence) {
+    const conf = data.confidence;
+    document.getElementById('confidenceBox').style.display = 'block';
+    document.getElementById('confidenceRadius').textContent =
+      `${conf.radius_km.toLocaleString()} km (${conf.radius_nm.toLocaleString()} nm)`;
+    document.getElementById('confidenceDetails').innerHTML =
+      `Center: ${conf.center_lat.toFixed(3)}, ${conf.center_lon.toFixed(3)} | ` +
+      `${conf.radius_mi.toLocaleString()} miles | ${conf.n_candidates} candidate points | ` +
+      `Best score: ${conf.best_score}/${data.circles.length} circles`;
+
+    // Draw confidence polygon
+    if (conf.polygon && conf.polygon.length > 0) {
+      const confLatLngs = conf.polygon.map(p => [p[0], p[1]]);
+      trackConfidenceLayer = L.polygon(confLatLngs, {
+        color: '#3fb950',
+        fillColor: '#3fb950',
+        fillOpacity: 0.15,
+        weight: 2,
+        dashArray: '6,4',
+      }).addTo(map);
+      trackCircleLayers.push(trackConfidenceLayer);
+    }
+
+    // Center marker
+    trackCenterMarker = L.circleMarker([conf.center_lat, conf.center_lon], {
+      radius: 7, color: '#3fb950', fillColor: '#3fb950', fillOpacity: 1, weight: 2,
+    }).addTo(map).bindTooltip(
+      `Est. ship location<br>${conf.center_lat.toFixed(3)}, ${conf.center_lon.toFixed(3)}<br>` +
+      `Confidence: ${conf.radius_km} km`,
+      { direction: 'top', permanent: false }
+    );
+    trackCircleLayers.push(trackCenterMarker);
+
+    // Fit map to show confidence region + circles
+    if (trackCircleLayers.length > 0) {
+      const group = L.featureGroup(trackCircleLayers);
+      map.fitBounds(group.getBounds().pad(0.2));
+    }
+  } else {
+    document.getElementById('confidenceBox').style.display = 'none';
+    // Still fit to circles if any
+    if (trackCircleLayers.length > 0) {
+      const group = L.featureGroup(trackCircleLayers);
+      map.fitBounds(group.getBounds().pad(0.2));
+    }
   }
 }
 

@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.env
+sat_tracker_cache/

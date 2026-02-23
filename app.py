@@ -449,6 +449,9 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
     Given multiple slant range circles, find the intersection region
     by sampling points and scoring how many circles each point lies near.
     Returns a confidence polygon and center estimate.
+
+    Uses adaptive tolerance based on actual range spread, and weights
+    candidates by total error to tighten the confidence region.
     """
     if len(circles_data) < 2:
         return None
@@ -465,17 +468,18 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
         ))
         ranges.append(c["ship_slant_range_km"])
 
-    # Build candidate grid from circle intersections
-    # Sample points along each circle and check distance to other circles
-    candidates = []
-    range_tolerance_km = 500  # ±500 km tolerance band
+    # Adaptive tolerance: based on range spread (RTT jitter)
+    range_spread = max(ranges) - min(ranges) if len(ranges) > 1 else 500
+    range_tolerance_km = max(200, range_spread * 1.5)
 
+    # Sample points along each circle and score by proximity to all circles
+    candidates = []
     for i, pts_i in enumerate(all_circle_points):
-        for pt in pts_i[::3]:  # every 3rd point for speed
+        step = max(1, len(pts_i) // 90)  # ~90 samples per circle
+        for pt in pts_i[::step]:
             lat, lon = pt[0], pt[1]
             pt_ecef = geodetic_to_ecef(lat, lon, 0.0)
 
-            # Score: how many other circles is this point near?
             score = 0
             total_err = 0
             for j, sat_ecef_j in enumerate(sat_positions):
@@ -491,7 +495,7 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
 
     if not candidates:
         # Widen tolerance and try again
-        range_tolerance_km = 1000
+        range_tolerance_km *= 2
         for i, pts_i in enumerate(all_circle_points):
             for pt in pts_i:
                 lat, lon = pt[0], pt[1]
@@ -514,11 +518,15 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
     # Sort by score (desc) then total error (asc)
     candidates.sort(key=lambda c: (-c[2], c[3]))
 
-    # Take top candidates and compute centroid + bounding region
+    # Take candidates that score well AND have low total error
     n_circles = len(circles_data)
-    best = [c for c in candidates if c[2] >= max(2, n_circles - 1)]
-    if not best:
-        best = candidates[:50]
+    high_score = [c for c in candidates if c[2] >= max(2, n_circles - 1)]
+    if not high_score:
+        high_score = candidates[:50]
+
+    # Further filter to the best 50% by error (tightest cluster)
+    high_score.sort(key=lambda c: c[3])
+    best = high_score[:max(10, len(high_score) // 2)]
 
     lats = [c[0] for c in best]
     lons = [c[1] for c in best]
@@ -526,21 +534,22 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
     center_lat = sum(lats) / len(lats)
     center_lon = sum(lons) / len(lons)
 
-    # Compute radius of confidence region
-    max_dist = 0
+    # Compute radius — use 90th percentile instead of max for robustness
+    dists = []
     for lat, lon, _, _ in best:
-        dlat = (lat - center_lat) * 111.0  # km per degree
+        dlat = (lat - center_lat) * 111.0
         dlon = (lon - center_lon) * 111.0 * math.cos(math.radians(center_lat))
-        dist = math.sqrt(dlat ** 2 + dlon ** 2)
-        max_dist = max(max_dist, dist)
+        dists.append(math.sqrt(dlat ** 2 + dlon ** 2))
+    dists.sort()
+    p90_idx = int(len(dists) * 0.9)
+    radius_km = dists[p90_idx] if p90_idx < len(dists) else dists[-1]
 
     # Generate confidence circle polygon
     confidence_points = []
     for i in range(72):
         angle = 2 * math.pi * i / 72
-        # radius in degrees
-        r_lat = max_dist / 111.0
-        r_lon = max_dist / (111.0 * max(0.01, math.cos(math.radians(center_lat))))
+        r_lat = radius_km / 111.0
+        r_lon = radius_km / (111.0 * max(0.01, math.cos(math.radians(center_lat))))
         pt_lat = center_lat + r_lat * math.sin(angle)
         pt_lon = center_lon + r_lon * math.cos(angle)
         confidence_points.append([round(pt_lat, 4), round(pt_lon, 4)])
@@ -549,11 +558,12 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
     return {
         "center_lat": round(center_lat, 4),
         "center_lon": round(center_lon, 4),
-        "radius_km": round(max_dist, 1),
-        "radius_nm": round(max_dist / 1.852, 1),
-        "radius_mi": round(max_dist / 1.609, 1),
+        "radius_km": round(radius_km, 1),
+        "radius_nm": round(radius_km / 1.852, 1),
+        "radius_mi": round(radius_km / 1.609, 1),
         "n_candidates": len(best),
         "best_score": best[0][2] if best else 0,
+        "range_tolerance_km": round(range_tolerance_km, 1),
         "polygon": confidence_points,
     }
 
@@ -603,22 +613,29 @@ def _tracking_worker(track_id: str, ip: str, interval_sec: int,
         one_way_total_km = (sat_leg_rtt / 2) / 1000 * C_KM_S
 
         # Try each O3b satellite — only those visible from teleport (elevation > 5°)
-        best_circle = None
-        best_range_diff = float("inf")
-
+        # Sort by elevation descending (highest elevation = shortest uplink = most
+        # range budget for ship). Pick the first one that gives an unclamped circle,
+        # or the one with shortest uplink if all are clamped.
+        candidates_by_elev = []
         for sat in o3b_sats:
             rng = compute_slant_range(
                 teleport_lat, teleport_lon, 0.0,
                 sat["lat_deg"], sat["lon_deg"], sat["alt_km"],
             )
-            # Skip satellites not visible from teleport
             if rng["elevation_deg"] < 5.0:
                 continue
+            candidates_by_elev.append((rng, sat))
+        candidates_by_elev.sort(key=lambda x: -x[0]["elevation_deg"])
 
+        best_circle = None
+        best_unclamped = None
+        best_clamped = None
+        shortest_uplink = float("inf")
+
+        for rng, sat in candidates_by_elev:
             uplink_km = rng["slant_range_km"]
             ship_range = one_way_total_km - uplink_km
 
-            # Minimum circle range = altitude * 1.005 to ensure non-degenerate circle
             min_range = sat["alt_km"] * 1.005
             clamped = False
             if ship_range < min_range:
@@ -626,7 +643,7 @@ def _tracking_worker(track_id: str, ip: str, interval_sec: int,
                     ship_range = min_range
                     clamped = True
                 else:
-                    continue  # impossible geometry
+                    continue
 
             circle_pts = _slant_range_circle(
                 sat["lat_deg"], sat["lon_deg"], sat["alt_km"],
@@ -643,12 +660,16 @@ def _tracking_worker(track_id: str, ip: str, interval_sec: int,
             }
             if clamped:
                 candidate["clamped"] = True
-            # Prefer the satellite that gives a range closest to the altitude
-            # (most likely directly above or near the ship)
-            diff = abs(ship_range - sat["alt_km"])
-            if diff < best_range_diff:
-                best_range_diff = diff
-                best_circle = candidate
+                # Track best clamped by shortest uplink
+                if uplink_km < shortest_uplink:
+                    shortest_uplink = uplink_km
+                    best_clamped = candidate
+            else:
+                # Prefer unclamped with shortest uplink (highest gateway elevation)
+                if best_unclamped is None:
+                    best_unclamped = candidate
+
+        best_circle = best_unclamped or best_clamped
 
         measurement = {
             "round": round_num + 1,
@@ -683,14 +704,37 @@ def _tracking_worker(track_id: str, ip: str, interval_sec: int,
     session["completed_at"] = datetime.now(timezone.utc).isoformat()
 
 
+# Known O3b mPOWER gateway locations (SES announced sites)
+O3B_GATEWAYS = {
+    "thermopylae_greece": {"lat": 38.90, "lon": 22.56, "label": "Thermopylae, Greece"},
+    "hawaii_us": {"lat": 21.52, "lon": -158.00, "label": "Hawaii, US (SES)"},
+    "dubbo_australia": {"lat": -32.24, "lon": 148.60, "label": "Dubbo, Australia"},
+    "merredin_australia": {"lat": -31.48, "lon": 118.28, "label": "Merredin, Australia"},
+    "phoenix_us": {"lat": 33.45, "lon": -112.07, "label": "Phoenix, Arizona, US"},
+    "gandoul_senegal": {"lat": 14.58, "lon": -17.10, "label": "Gandoul, Senegal"},
+    "chile": {"lat": -33.45, "lon": -70.67, "label": "Santiago, Chile"},
+    "uae": {"lat": 24.45, "lon": 54.65, "label": "Abu Dhabi, UAE"},
+    "south_africa": {"lat": -25.75, "lon": 28.23, "label": "Johannesburg, South Africa"},
+    "peru": {"lat": -12.05, "lon": -77.03, "label": "Lima, Peru"},
+    "brazil": {"lat": -23.55, "lon": -46.63, "label": "São Paulo, Brazil"},
+    "portugal": {"lat": 38.75, "lon": -9.14, "label": "Lisbon, Portugal"},
+}
+
+
+@app.get("/api/o3b_gateways")
+def o3b_gateways():
+    """Return known O3b mPOWER gateway locations."""
+    return O3B_GATEWAYS
+
+
 class TrackRequest(BaseModel):
     ip: str
     interval_sec: int = 1800        # 30 minutes default
     n_rounds: int = 6               # 6 rounds = 3 hours at 30min intervals
     pings_per_round: int = 20       # 20 pings per round for stable min RTT
     ground_delay_ms: float = 5.0    # minimal ground delay
-    teleport_lat: float = 49.68     # SES Betzdorf Luxembourg
-    teleport_lon: float = 6.33
+    teleport_lat: float = 38.90     # Thermopylae, Greece (O3b gateway)
+    teleport_lon: float = 22.56
 
 
 @app.post("/api/track")

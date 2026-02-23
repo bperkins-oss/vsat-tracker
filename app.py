@@ -352,21 +352,16 @@ def geolocate(req: GeolocateRequest):
 
         slant_range_km = one_way_total_km - uplink_km
 
-        # Sanity checks
-        min_range = pos["alt_km"] - 50
-        max_range = 42500  # GEO at very low elevation + margin
-        if slant_range_km < min_range:
-            circles.append({
-                "norad_id": ping.norad_id,
-                "error": f"Computed ship range {slant_range_km:.0f} km < satellite altitude {pos['alt_km']:.0f} km — ground/teleport delays may be too large",
-            })
-            continue
-        if slant_range_km > max_range and pos["orbit_type"] == "GEO":
-            note = " (no teleport location — range includes uplink path)" if not teleport_info else ""
-            circles.append({
-                "norad_id": ping.norad_id,
-                "error": f"Computed ship range {slant_range_km:.0f} km exceeds max GEO range ~41,000 km{note}. Provide teleport location or increase ground delay.",
-            })
+        # Sanity checks — warn but always draw
+        warning = None
+        if slant_range_km < pos["alt_km"] * 0.9:
+            warning = f"Range {slant_range_km:.0f} km below expected min — clamped to satellite altitude"
+            slant_range_km = pos["alt_km"]
+        elif slant_range_km > 42500 and pos["orbit_type"] == "GEO":
+            if not teleport_info:
+                warning = "No teleport — range includes uplink path. Circle wider than true location."
+            else:
+                warning = "Range exceeds typical max. Ship at very low elevation or delays need tuning."
 
         # Compute the circle on Earth's surface
         points = _slant_range_circle(
@@ -394,6 +389,8 @@ def geolocate(req: GeolocateRequest):
         }
         if teleport_info:
             result["teleport"] = teleport_info
+        if warning:
+            result["warning"] = warning
         circles.append(result)
 
     return {"circles": circles}

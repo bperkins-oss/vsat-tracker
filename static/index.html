@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VSAT Satellite Tracker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Consolas', 'SF Mono', 'Monaco', monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    overflow-x: hidden;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+  }
+  .header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: #f0f6fc;
+    letter-spacing: 0.5px;
+  }
+  .header .status {
+    font-size: 12px;
+    color: #8b949e;
+  }
+  .header .status .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3fb950;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .header .status .dot.loading {
+    background: #d29922;
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* Filter bar */
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    flex-wrap: wrap;
+  }
+  .filters select, .filters input {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  .filters select:focus, .filters input:focus {
+    border-color: #58a6ff;
+  }
+  .filters label {
+    font-size: 12px;
+    color: #8b949e;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .filters label input[type="checkbox"] {
+    accent-color: #58a6ff;
+  }
+  .orbit-toggles {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .orbit-toggles .tag {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  .tag-geo { background: #f0883e22; color: #f0883e; }
+  .tag-meo { background: #58a6ff22; color: #58a6ff; }
+  .tag-leo { background: #3fb95022; color: #3fb950; }
+
+  /* Map */
+  #map {
+    width: 100%;
+    height: 55vh;
+    min-height: 350px;
+    border-bottom: 1px solid #30363d;
+  }
+  .leaflet-container { background: #0d1117; }
+
+  /* Table */
+  .table-container {
+    overflow-x: auto;
+    padding: 0 20px 20px;
+  }
+  .table-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+  }
+  .table-header h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f0f6fc;
+  }
+  .table-header .count {
+    font-size: 12px;
+    color: #8b949e;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  thead th {
+    text-align: left;
+    padding: 8px 12px;
+    color: #8b949e;
+    font-weight: 600;
+    border-bottom: 1px solid #30363d;
+    position: sticky;
+    top: 0;
+    background: #0d1117;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  thead th:hover { color: #c9d1d9; }
+  tbody tr {
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  tbody tr:hover { background: #161b22; }
+  tbody td {
+    padding: 6px 12px;
+    border-bottom: 1px solid #21262d;
+    white-space: nowrap;
+  }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* Popup */
+  .leaflet-popup-content-wrapper {
+    background: #161b22 !important;
+    color: #c9d1d9 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+    font-family: inherit !important;
+  }
+  .leaflet-popup-tip { background: #161b22 !important; }
+  .leaflet-popup-content { font-size: 12px; line-height: 1.6; }
+  .leaflet-popup-content b { color: #f0f6fc; }
+  .popup-orbit {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  /* Range panel */
+  .range-panel {
+    display: none;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+    margin: 0 20px 16px;
+  }
+  .range-panel.visible { display: block; }
+  .range-panel h3 { font-size: 13px; color: #f0f6fc; margin-bottom: 8px; }
+  .range-form {
+    display: flex;
+    gap: 8px;
+    align-items: end;
+    flex-wrap: wrap;
+  }
+  .range-form .field { display: flex; flex-direction: column; gap: 2px; }
+  .range-form .field label { font-size: 11px; color: #8b949e; }
+  .range-form .field input {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    width: 100px;
+  }
+  .range-form button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .range-form button:hover { background: #2ea043; }
+  .range-result {
+    margin-top: 10px;
+    font-size: 12px;
+    line-height: 1.8;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>VSAT Satellite Tracker</h1>
+  <div class="status">
+    <span class="dot loading" id="statusDot"></span>
+    <span id="statusText">Loading fleet...</span>
+  </div>
+</div>
+
+<div class="filters">
+  <select id="providerFilter">
+    <option value="">All Providers</option>
+  </select>
+
+  <div class="orbit-toggles">
+    <label><input type="checkbox" id="toggleGEO" checked>
+      <span class="tag tag-geo">GEO</span></label>
+    <label><input type="checkbox" id="toggleMEO" checked>
+      <span class="tag tag-meo">MEO</span></label>
+    <label><input type="checkbox" id="toggleLEO" checked>
+      <span class="tag tag-leo">LEO</span></label>
+  </div>
+
+  <input type="text" id="searchBox" placeholder="Search satellites..." style="width: 200px;">
+</div>
+
+<div id="map"></div>
+
+<div class="range-panel" id="rangePanel">
+  <h3>Slant Range Calculator — <span id="rangeTarget"></span></h3>
+  <div class="range-form">
+    <div class="field">
+      <label>Observer Lat</label>
+      <input type="number" id="obsLat" step="0.01" value="25.0">
+    </div>
+    <div class="field">
+      <label>Observer Lon</label>
+      <input type="number" id="obsLon" step="0.01" value="-80.0">
+    </div>
+    <div class="field">
+      <label>Alt (km)</label>
+      <input type="number" id="obsAlt" step="0.001" value="0">
+    </div>
+    <button onclick="calcRange()">Calculate</button>
+  </div>
+  <div class="range-result" id="rangeResult"></div>
+</div>
+
+<div class="table-header">
+  <h2>Satellite Positions</h2>
+  <span class="count" id="tableCount"></span>
+</div>
+
+<div class="table-container">
+  <table>
+    <thead>
+      <tr>
+        <th data-sort="name">Name</th>
+        <th data-sort="norad_id">NORAD</th>
+        <th data-sort="provider">Provider</th>
+        <th data-sort="lat_deg" class="num">Lat</th>
+        <th data-sort="lon_deg" class="num">Lon</th>
+        <th data-sort="alt_km" class="num">Alt (km)</th>
+        <th data-sort="orbit_type">Orbit</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let allSatellites = [];
+let markers = {};
+let selectedNorad = null;
+let sortCol = 'provider';
+let sortAsc = true;
+let refreshTimer = null;
+
+// ---------------------------------------------------------------------------
+// Map setup
+// ---------------------------------------------------------------------------
+const map = L.map('map', {
+  center: [20, 0],
+  zoom: 2,
+  minZoom: 2,
+  maxZoom: 10,
+  worldCopyJump: true,
+});
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 19,
+}).addTo(map);
+
+// ---------------------------------------------------------------------------
+// Colors
+// ---------------------------------------------------------------------------
+const orbitColor = { GEO: '#f0883e', MEO: '#58a6ff', LEO: '#3fb950' };
+const orbitBg = { GEO: '#f0883e22', MEO: '#58a6ff22', LEO: '#3fb95022' };
+
+function satIcon(orbit, selected) {
+  const size = selected ? 12 : (orbit === 'GEO' ? 8 : 6);
+  const color = orbitColor[orbit] || '#8b949e';
+  const border = selected ? '2px solid #f0f6fc' : 'none';
+  return L.divIcon({
+    className: '',
+    html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:${border};"></div>`,
+    iconSize: [size, size],
+    iconAnchor: [size/2, size/2],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+async function loadProviders() {
+  try {
+    const resp = await fetch('/api/providers');
+    const data = await resp.json();
+    const sel = document.getElementById('providerFilter');
+
+    const optOps = document.createElement('optgroup');
+    optOps.label = 'Operators';
+    data.operators.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = `${p.name.toUpperCase()} (${p.orbit})`;
+      optOps.appendChild(opt);
+    });
+    sel.appendChild(optOps);
+
+    const optSvc = document.createElement('optgroup');
+    optSvc.label = 'Service Providers';
+    data.service_providers.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = `${p.name.toUpperCase()} — ${p.desc}`;
+      optSvc.appendChild(opt);
+    });
+    sel.appendChild(optSvc);
+  } catch(e) {
+    console.error('Failed to load providers:', e);
+  }
+}
+
+async function loadFleet() {
+  const dot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  dot.classList.add('loading');
+  statusText.textContent = 'Updating positions...';
+
+  try {
+    const resp = await fetch('/api/fleet');
+    const data = await resp.json();
+    allSatellites = data.satellites;
+    dot.classList.remove('loading');
+    statusText.textContent = `${data.count} satellites — ${new Date(data.time).toUTCString()}`;
+    applyFilters();
+  } catch(e) {
+    dot.classList.remove('loading');
+    statusText.textContent = 'Error loading fleet';
+    console.error(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filtering
+// ---------------------------------------------------------------------------
+function getFiltered() {
+  const provVal = document.getElementById('providerFilter').value;
+  const showGEO = document.getElementById('toggleGEO').checked;
+  const showMEO = document.getElementById('toggleMEO').checked;
+  const showLEO = document.getElementById('toggleLEO').checked;
+  const q = document.getElementById('searchBox').value.toUpperCase().trim();
+
+  return allSatellites.filter(s => {
+    if (provVal && s.provider !== provVal) return false;
+    if (s.orbit_type === 'GEO' && !showGEO) return false;
+    if (s.orbit_type === 'MEO' && !showMEO) return false;
+    if (s.orbit_type === 'LEO' && !showLEO) return false;
+    if (q && !s.name.toUpperCase().includes(q) && !String(s.norad_id).includes(q)) return false;
+    return true;
+  });
+}
+
+function applyFilters() {
+  const filtered = getFiltered();
+  renderMap(filtered);
+  renderTable(filtered);
+}
+
+// ---------------------------------------------------------------------------
+// Map rendering
+// ---------------------------------------------------------------------------
+function renderMap(satellites) {
+  // Remove old markers
+  Object.values(markers).forEach(m => map.removeLayer(m));
+  markers = {};
+
+  satellites.forEach(s => {
+    const m = L.marker([s.lat_deg, s.lon_deg], {
+      icon: satIcon(s.orbit_type, s.norad_id === selectedNorad),
+      zIndexOffset: s.orbit_type === 'GEO' ? 100 : 0,
+    });
+
+    const orbitStyle = `background:${orbitBg[s.orbit_type]};color:${orbitColor[s.orbit_type]}`;
+    m.bindPopup(`
+      <b>${s.name}</b><br>
+      NORAD: ${s.norad_id}<br>
+      Provider: ${s.provider.toUpperCase()}<br>
+      <span class="popup-orbit" style="${orbitStyle}">${s.orbit_type}</span>
+      Alt: ${s.alt_km.toLocaleString(undefined, {maximumFractionDigits: 1})} km<br>
+      Lat: ${fmtCoord(s.lat_deg, 'NS')} &nbsp; Lon: ${fmtCoord(s.lon_deg, 'EW')}<br>
+      <a href="#" onclick="openRange(${s.norad_id}, '${s.name.replace(/'/g,"\\'")}'); return false;"
+         style="color:#58a6ff;">Calculate slant range</a>
+    `, { maxWidth: 280 });
+
+    m.addTo(map);
+    markers[s.norad_id] = m;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Table rendering
+// ---------------------------------------------------------------------------
+function renderTable(satellites) {
+  // Sort
+  const sorted = [...satellites].sort((a, b) => {
+    let va = a[sortCol], vb = b[sortCol];
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va < vb) return sortAsc ? -1 : 1;
+    if (va > vb) return sortAsc ? 1 : -1;
+    return 0;
+  });
+
+  document.getElementById('tableCount').textContent = `${sorted.length} satellites`;
+
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = sorted.map(s => `
+    <tr onclick="panTo(${s.norad_id})" data-nid="${s.norad_id}"
+        style="${s.norad_id === selectedNorad ? 'background:#161b22;' : ''}">
+      <td>${s.name}</td>
+      <td class="num">${s.norad_id}</td>
+      <td>${s.provider.toUpperCase()}</td>
+      <td class="num">${fmtCoord(s.lat_deg, 'NS')}</td>
+      <td class="num">${fmtCoord(s.lon_deg, 'EW')}</td>
+      <td class="num">${s.alt_km.toLocaleString(undefined, {maximumFractionDigits: 1})}</td>
+      <td><span class="tag tag-${s.orbit_type.toLowerCase()}">${s.orbit_type}</span></td>
+    </tr>
+  `).join('');
+}
+
+function fmtCoord(deg, dirs) {
+  const d = Math.abs(deg).toFixed(4);
+  const dir = deg >= 0 ? dirs[0] : dirs[1];
+  return `${d}\u00B0${dir}`;
+}
+
+// ---------------------------------------------------------------------------
+// Interactions
+// ---------------------------------------------------------------------------
+function panTo(noradId) {
+  const m = markers[noradId];
+  if (m) {
+    map.setView(m.getLatLng(), Math.max(map.getZoom(), 4), { animate: true });
+    m.openPopup();
+  }
+}
+
+function openRange(noradId, name) {
+  selectedNorad = noradId;
+  document.getElementById('rangePanel').classList.add('visible');
+  document.getElementById('rangeTarget').textContent = `${name} (${noradId})`;
+  document.getElementById('rangeResult').innerHTML = '';
+}
+
+async function calcRange() {
+  if (!selectedNorad) return;
+  const lat = parseFloat(document.getElementById('obsLat').value);
+  const lon = parseFloat(document.getElementById('obsLon').value);
+  const alt = parseFloat(document.getElementById('obsAlt').value) || 0;
+
+  try {
+    const resp = await fetch(`/api/range?norad_id=${selectedNorad}&lat=${lat}&lon=${lon}&alt=${alt}`);
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('rangeResult').innerHTML = `<span style="color:#f85149">Error: ${data.error}</span>`;
+      return;
+    }
+    const r = data.range;
+    document.getElementById('rangeResult').innerHTML = `
+      Slant range: <b>${r.slant_range_km.toLocaleString(undefined, {maximumFractionDigits: 1})} km</b><br>
+      Elevation: <b>${r.elevation_deg.toFixed(2)}&deg;</b> &nbsp;
+      Azimuth: <b>${r.azimuth_deg.toFixed(2)}&deg;</b><br>
+      One-way delay: <b>${r.one_way_delay_ms.toFixed(3)} ms</b> &nbsp;
+      Round-trip: <b>${r.round_trip_delay_ms.toFixed(3)} ms</b>
+    `;
+
+    // Draw line from observer to satellite
+    const sat = data.satellite;
+    L.polyline([[lat, lon], [sat.lat_deg, sat.lon_deg]], {
+      color: '#58a6ff', weight: 1, dashArray: '5,5', opacity: 0.6,
+    }).addTo(map);
+  } catch(e) {
+    document.getElementById('rangeResult').innerHTML = `<span style="color:#f85149">Request failed</span>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sort headers
+// ---------------------------------------------------------------------------
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.sort;
+    if (sortCol === col) {
+      sortAsc = !sortAsc;
+    } else {
+      sortCol = col;
+      sortAsc = true;
+    }
+    // Update header arrows
+    document.querySelectorAll('th[data-sort]').forEach(h => {
+      h.textContent = h.textContent.replace(/ [▲▼]$/, '');
+    });
+    th.textContent += sortAsc ? ' ▲' : ' ▼';
+    applyFilters();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Filter event listeners
+// ---------------------------------------------------------------------------
+document.getElementById('providerFilter').addEventListener('change', applyFilters);
+document.getElementById('toggleGEO').addEventListener('change', applyFilters);
+document.getElementById('toggleMEO').addEventListener('change', applyFilters);
+document.getElementById('toggleLEO').addEventListener('change', applyFilters);
+
+let searchTimeout;
+document.getElementById('searchBox').addEventListener('input', () => {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(applyFilters, 250);
+});
+
+// ---------------------------------------------------------------------------
+// Auto-refresh
+// ---------------------------------------------------------------------------
+function startRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(loadFleet, 30000);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+loadProviders();
+loadFleet().then(startRefresh);
+</script>
+</body>
+</html>

@@ -907,10 +907,47 @@ function drawGeoCircles(circles) {
 }
 
 function clearGeolocate() {
+  // Remove circles from map
   geoCircles.forEach(l => map.removeLayer(l));
   geoCircles = [];
+  // Hide results
   document.getElementById('geoResult').classList.remove('visible');
   document.getElementById('geoResult').innerHTML = '';
+  // Reset to single empty ping row
+  const rows = document.getElementById('pingRows');
+  rows.innerHTML = '';
+  pingRowCount = 1;
+  const row = document.createElement('div');
+  row.className = 'ping-row';
+  row.dataset.idx = '0';
+  row.innerHTML = `
+    <div class="field">
+      <label>Satellite</label>
+      <select class="ping-sat"></select>
+    </div>
+    <div class="field">
+      <label>Total RTT (ms)</label>
+      <input type="number" class="ping-rtt" step="0.1" placeholder="e.g. 580">
+    </div>
+    <div class="field">
+      <label>Ground delay (ms)</label>
+      <input type="number" class="ping-ground" step="0.1" value="0">
+    </div>
+    <div class="field">
+      <label>Teleport Lat</label>
+      <input type="number" class="ping-tp-lat" step="0.01" placeholder="e.g. 51.5">
+    </div>
+    <div class="field">
+      <label>Teleport Lon</label>
+      <input type="number" class="ping-tp-lon" step="0.01" placeholder="e.g. -0.1">
+    </div>
+    <div class="field">
+      <label>Time (UTC, optional)</label>
+      <input type="text" class="ping-time" placeholder="now">
+    </div>
+  `;
+  rows.appendChild(row);
+  populateSatSelect(row.querySelector('.ping-sat'));
 }
 
 // ---------------------------------------------------------------------------

@@ -5,19 +5,29 @@ FastAPI app wrapping SatellitePropagator for a web-based satellite map.
 Preloads all VSAT TLEs on startup, then serves positions from memory.
 """
 
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import List
 
+import numpy as np
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from sat_tracker import (
     VSAT_FLEET,
     SERVICE_PROVIDERS,
     SatellitePropagator,
     compute_slant_range,
+    geodetic_to_ecef,
+    C_KM_S,
+    WGS84_A,
+    WGS84_F,
+    WGS84_E2,
+    WGS84_B,
 )
 
 # ---------------------------------------------------------------------------
@@ -203,6 +213,190 @@ def search(q: str = Query(..., min_length=1)):
             })
     matches.sort(key=lambda m: m["name"])
     return {"query": q, "count": len(matches), "results": matches[:50]}
+
+
+# ---------------------------------------------------------------------------
+# Geolocation from RTT
+# ---------------------------------------------------------------------------
+
+class PingMeasurement(BaseModel):
+    norad_id: int
+    rtt_ms: float
+    ground_delay_ms: float = 0.0
+    teleport_lat: float | None = None
+    teleport_lon: float | None = None
+    time: str | None = None
+
+
+class GeolocateRequest(BaseModel):
+    pings: List[PingMeasurement]
+
+
+def _slant_range_circle(sat_lat, sat_lon, sat_alt, target_range_km, n_points=360):
+    """
+    Compute the circle of points on Earth's surface at a given slant range
+    from a satellite. Returns list of [lat, lon] pairs.
+    """
+    sat_ecef = geodetic_to_ecef(sat_lat, sat_lon, sat_alt)
+    points = []
+
+    for i in range(n_points):
+        azimuth = 2 * math.pi * i / n_points
+
+        # Binary search on angular distance from sub-satellite point
+        lo, hi = 0.0, 80.0  # degrees
+        for _ in range(50):
+            mid = (lo + hi) / 2
+            # Great-circle destination from sub-satellite point
+            lat1 = math.radians(sat_lat)
+            lon1 = math.radians(sat_lon)
+            d = math.radians(mid)
+
+            lat2 = math.asin(
+                math.sin(lat1) * math.cos(d) +
+                math.cos(lat1) * math.sin(d) * math.cos(azimuth)
+            )
+            lon2 = lon1 + math.atan2(
+                math.sin(azimuth) * math.sin(d) * math.cos(lat1),
+                math.cos(d) - math.sin(lat1) * math.sin(lat2)
+            )
+
+            pt_lat = math.degrees(lat2)
+            pt_lon = math.degrees(lon2)
+            # Normalize longitude
+            pt_lon = ((pt_lon + 180) % 360) - 180
+
+            pt_ecef = geodetic_to_ecef(pt_lat, pt_lon, 0.0)
+            dx = sat_ecef - pt_ecef
+            rng = float(np.sqrt(np.sum(dx ** 2)))
+
+            if rng < target_range_km:
+                lo = mid
+            else:
+                hi = mid
+
+        # Use the converged point
+        lat1 = math.radians(sat_lat)
+        lon1 = math.radians(sat_lon)
+        d = math.radians((lo + hi) / 2)
+        lat2 = math.asin(
+            math.sin(lat1) * math.cos(d) +
+            math.cos(lat1) * math.sin(d) * math.cos(azimuth)
+        )
+        lon2 = lon1 + math.atan2(
+            math.sin(azimuth) * math.sin(d) * math.cos(lat1),
+            math.cos(d) - math.sin(lat1) * math.sin(lat2)
+        )
+        pt_lat = math.degrees(lat2)
+        pt_lon = math.degrees(lon2)
+        pt_lon = ((pt_lon + 180) % 360) - 180
+        points.append([round(pt_lat, 4), round(pt_lon, 4)])
+
+    # Close the circle
+    if points:
+        points.append(points[0])
+    return points
+
+
+@app.post("/api/geolocate")
+def geolocate(req: GeolocateRequest):
+    """
+    Given one or more ping measurements (satellite + RTT + ground delay),
+    compute slant range circles. Multiple pings produce intersecting circles
+    that constrain the ship's location.
+
+    The ping path is: You -> internet -> teleport -> satellite -> ship (and back).
+    - ground_delay_ms: round-trip internet/terrestrial portion (you <-> teleport)
+    - Satellite leg RTT = total RTT - ground_delay_ms
+    - One-way through satellite = sat_leg_rtt / 2 = teleport->satellite + satellite->ship
+    - If teleport location given, we subtract teleport->satellite distance
+    - What remains = satellite->ship slant range -> draw circle
+    """
+    circles = []
+    for ping in req.pings:
+        dt = parse_time(ping.time)
+        try:
+            pos = propagator.propagate(ping.norad_id, dt)
+        except ValueError as e:
+            circles.append({"norad_id": ping.norad_id, "error": str(e)})
+            continue
+        if pos.get("error", 0) != 0:
+            circles.append({"norad_id": ping.norad_id, "error": pos.get("error_msg", "SGP4 error")})
+            continue
+
+        # Isolate satellite leg
+        sat_leg_rtt = ping.rtt_ms - ping.ground_delay_ms
+        if sat_leg_rtt <= 0:
+            circles.append({"norad_id": ping.norad_id, "error": "Ground delay exceeds total RTT"})
+            continue
+
+        # One-way through satellite = teleport->sat + sat->ship
+        one_way_total_ms = sat_leg_rtt / 2
+        one_way_total_km = one_way_total_ms / 1000 * C_KM_S
+
+        # Subtract teleport-to-satellite distance if teleport location given
+        uplink_km = 0.0
+        teleport_info = None
+        if ping.teleport_lat is not None and ping.teleport_lon is not None:
+            rng = compute_slant_range(
+                ping.teleport_lat, ping.teleport_lon, 0.0,
+                pos["lat_deg"], pos["lon_deg"], pos["alt_km"],
+            )
+            uplink_km = rng["slant_range_km"]
+            teleport_info = {
+                "lat": ping.teleport_lat,
+                "lon": ping.teleport_lon,
+                "uplink_range_km": round(uplink_km, 1),
+                "uplink_delay_ms": round(rng["one_way_delay_ms"], 3),
+            }
+
+        slant_range_km = one_way_total_km - uplink_km
+
+        # Sanity checks
+        min_range = pos["alt_km"] - 50
+        max_range = 42500  # GEO at very low elevation + margin
+        if slant_range_km < min_range:
+            circles.append({
+                "norad_id": ping.norad_id,
+                "error": f"Computed ship range {slant_range_km:.0f} km < satellite altitude {pos['alt_km']:.0f} km — ground/teleport delays may be too large",
+            })
+            continue
+        if slant_range_km > max_range and pos["orbit_type"] == "GEO":
+            note = " (no teleport location — range includes uplink path)" if not teleport_info else ""
+            circles.append({
+                "norad_id": ping.norad_id,
+                "error": f"Computed ship range {slant_range_km:.0f} km exceeds max GEO range ~41,000 km{note}. Provide teleport location or increase ground delay.",
+            })
+
+        # Compute the circle on Earth's surface
+        points = _slant_range_circle(
+            pos["lat_deg"], pos["lon_deg"], pos["alt_km"],
+            slant_range_km, n_points=360,
+        )
+
+        result = {
+            "norad_id": ping.norad_id,
+            "name": pos["name"],
+            "time": dt.isoformat(),
+            "satellite": {
+                "lat": pos["lat_deg"],
+                "lon": pos["lon_deg"],
+                "alt_km": pos["alt_km"],
+            },
+            "measured_rtt_ms": ping.rtt_ms,
+            "ground_delay_ms": ping.ground_delay_ms,
+            "satellite_leg_rtt_ms": round(sat_leg_rtt, 1),
+            "one_way_through_sat_ms": round(one_way_total_ms, 3),
+            "one_way_through_sat_km": round(one_way_total_km, 1),
+            "ship_slant_range_km": round(slant_range_km, 1),
+            "ship_one_way_delay_ms": round(slant_range_km / C_KM_S * 1000, 3),
+            "circle": points,
+        }
+        if teleport_info:
+            result["teleport"] = teleport_info
+        circles.append(result)
+
+    return {"circles": circles}
 
 
 # ---------------------------------------------------------------------------

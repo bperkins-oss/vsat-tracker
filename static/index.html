@@ -225,6 +225,87 @@
     font-size: 12px;
     line-height: 1.8;
   }
+
+  /* Geolocate panel */
+  .geo-panel {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+    margin: 12px 20px;
+  }
+  .geo-panel h3 {
+    font-size: 14px;
+    color: #f0f6fc;
+    margin-bottom: 4px;
+  }
+  .geo-panel .subtitle {
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 12px;
+  }
+  .ping-rows { display: flex; flex-direction: column; gap: 8px; }
+  .ping-row {
+    display: flex;
+    gap: 8px;
+    align-items: end;
+    flex-wrap: wrap;
+    padding: 8px;
+    background: #0d1117;
+    border-radius: 6px;
+    border: 1px solid #21262d;
+  }
+  .ping-row .field { display: flex; flex-direction: column; gap: 2px; }
+  .ping-row .field label { font-size: 10px; color: #8b949e; }
+  .ping-row .field input, .ping-row .field select {
+    background: #161b22;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  .ping-row .field input { width: 110px; }
+  .ping-row .field select { width: 200px; }
+  .ping-row .remove-btn {
+    background: none;
+    border: none;
+    color: #f85149;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 4px;
+  }
+  .geo-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .geo-buttons button {
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-secondary { background: #30363d; color: #c9d1d9; }
+  .btn-secondary:hover { background: #3d444d; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .geo-result {
+    margin-top: 12px;
+    font-size: 12px;
+    line-height: 1.8;
+    padding: 10px;
+    background: #0d1117;
+    border-radius: 6px;
+    border: 1px solid #21262d;
+    display: none;
+  }
+  .geo-result.visible { display: block; }
 </style>
 </head>
 <body>
@@ -274,6 +355,45 @@
     <button onclick="calcRange()">Calculate</button>
   </div>
   <div class="range-result" id="rangeResult"></div>
+</div>
+
+<div class="geo-panel" id="geoPanel">
+  <h3>Ship Geolocation from Ping RTT</h3>
+  <div class="subtitle">Enter ping measurements. Subtract ground-side trace delays to isolate the satellite leg. Provide the teleport/ground station location to subtract the uplink path — what remains is the satellite-to-ship slant range. Each ping draws a range circle on the map.</div>
+  <div class="ping-rows" id="pingRows">
+    <div class="ping-row" data-idx="0">
+      <div class="field">
+        <label>Satellite</label>
+        <select class="ping-sat"></select>
+      </div>
+      <div class="field">
+        <label>Total RTT (ms)</label>
+        <input type="number" class="ping-rtt" step="0.1" placeholder="e.g. 580">
+      </div>
+      <div class="field">
+        <label>Ground delay (ms)</label>
+        <input type="number" class="ping-ground" step="0.1" value="0" placeholder="from traceroute">
+      </div>
+      <div class="field">
+        <label>Teleport Lat</label>
+        <input type="number" class="ping-tp-lat" step="0.01" placeholder="e.g. 51.5">
+      </div>
+      <div class="field">
+        <label>Teleport Lon</label>
+        <input type="number" class="ping-tp-lon" step="0.01" placeholder="e.g. -0.1">
+      </div>
+      <div class="field">
+        <label>Time (UTC, optional)</label>
+        <input type="text" class="ping-time" placeholder="now">
+      </div>
+    </div>
+  </div>
+  <div class="geo-buttons">
+    <button class="btn-primary" onclick="runGeolocate()">Draw Circles</button>
+    <button class="btn-secondary" onclick="addPingRow()">+ Add Ping</button>
+    <button class="btn-danger" onclick="clearGeolocate()">Clear</button>
+  </div>
+  <div class="geo-result" id="geoResult"></div>
 </div>
 
 <div class="table-header">
@@ -584,10 +704,223 @@ function startRefresh() {
 }
 
 // ---------------------------------------------------------------------------
+// Geolocation from RTT
+// ---------------------------------------------------------------------------
+let geoCircles = [];  // Leaflet layers
+let pingRowCount = 1;
+
+const circleColors = ['#f0883e', '#58a6ff', '#3fb950', '#d2a8ff', '#f778ba', '#ffa657'];
+
+function populateSatSelect(sel) {
+  sel.innerHTML = '<option value="">Select satellite...</option>';
+  const sorted = [...allSatellites].sort((a, b) => a.name.localeCompare(b.name));
+  // Group GEO first (most useful for geolocation)
+  const geo = sorted.filter(s => s.orbit_type === 'GEO');
+  const meo = sorted.filter(s => s.orbit_type === 'MEO');
+  const leo = sorted.filter(s => s.orbit_type === 'LEO');
+
+  [['GEO', geo], ['MEO', meo], ['LEO', leo]].forEach(([label, sats]) => {
+    if (sats.length === 0) return;
+    const grp = document.createElement('optgroup');
+    grp.label = label;
+    sats.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.norad_id;
+      opt.textContent = `${s.name} (${s.norad_id})`;
+      grp.appendChild(opt);
+    });
+    sel.appendChild(grp);
+  });
+}
+
+function initGeoSelects() {
+  document.querySelectorAll('.ping-sat').forEach(sel => {
+    if (sel.options.length <= 1) populateSatSelect(sel);
+  });
+}
+
+function addPingRow() {
+  const rows = document.getElementById('pingRows');
+  const idx = pingRowCount++;
+  const row = document.createElement('div');
+  row.className = 'ping-row';
+  row.dataset.idx = idx;
+  row.innerHTML = `
+    <div class="field">
+      <label>Satellite</label>
+      <select class="ping-sat"></select>
+    </div>
+    <div class="field">
+      <label>Total RTT (ms)</label>
+      <input type="number" class="ping-rtt" step="0.1" placeholder="e.g. 580">
+    </div>
+    <div class="field">
+      <label>Ground delay (ms)</label>
+      <input type="number" class="ping-ground" step="0.1" value="0">
+    </div>
+    <div class="field">
+      <label>Teleport Lat</label>
+      <input type="number" class="ping-tp-lat" step="0.01" placeholder="e.g. 51.5">
+    </div>
+    <div class="field">
+      <label>Teleport Lon</label>
+      <input type="number" class="ping-tp-lon" step="0.01" placeholder="e.g. -0.1">
+    </div>
+    <div class="field">
+      <label>Time (UTC, optional)</label>
+      <input type="text" class="ping-time" placeholder="now">
+    </div>
+    <button class="remove-btn" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  rows.appendChild(row);
+  populateSatSelect(row.querySelector('.ping-sat'));
+}
+
+async function runGeolocate() {
+  const rows = document.querySelectorAll('.ping-row');
+  const pings = [];
+  rows.forEach(row => {
+    const sat = row.querySelector('.ping-sat').value;
+    const rtt = parseFloat(row.querySelector('.ping-rtt').value);
+    const ground = parseFloat(row.querySelector('.ping-ground').value) || 0;
+    const tpLat = row.querySelector('.ping-tp-lat').value;
+    const tpLon = row.querySelector('.ping-tp-lon').value;
+    const time = row.querySelector('.ping-time').value || null;
+    if (sat && !isNaN(rtt)) {
+      const p = { norad_id: parseInt(sat), rtt_ms: rtt, ground_delay_ms: ground, time };
+      if (tpLat && tpLon) {
+        p.teleport_lat = parseFloat(tpLat);
+        p.teleport_lon = parseFloat(tpLon);
+      }
+      pings.push(p);
+    }
+  });
+
+  if (pings.length === 0) return;
+
+  try {
+    const resp = await fetch('/api/geolocate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pings }),
+    });
+    const data = await resp.json();
+    drawGeoCircles(data.circles);
+  } catch(e) {
+    console.error('Geolocate failed:', e);
+  }
+}
+
+function drawGeoCircles(circles) {
+  // Clear old circles
+  geoCircles.forEach(l => map.removeLayer(l));
+  geoCircles = [];
+
+  const resultDiv = document.getElementById('geoResult');
+  let html = '';
+
+  circles.forEach((c, i) => {
+    if (c.error) {
+      html += `<div style="color:#f85149">Ping ${i+1}: ${c.error}</div>`;
+      return;
+    }
+
+    const color = circleColors[i % circleColors.length];
+
+    // Draw the range circle
+    const latlngs = c.circle.map(p => [p[0], p[1]]);
+    const poly = L.polyline(latlngs, {
+      color: color,
+      weight: 2.5,
+      opacity: 0.85,
+      dashArray: null,
+    }).addTo(map);
+    geoCircles.push(poly);
+
+    // Draw satellite marker with label
+    const satMarker = L.circleMarker([c.satellite.lat, c.satellite.lon], {
+      radius: 5,
+      color: color,
+      fillColor: color,
+      fillOpacity: 1,
+      weight: 2,
+    }).addTo(map).bindTooltip(`${c.name}`, {
+      permanent: false,
+      className: '',
+      direction: 'top',
+    });
+    geoCircles.push(satMarker);
+
+    // Draw teleport marker + uplink line if provided
+    if (c.teleport) {
+      const tpMarker = L.circleMarker([c.teleport.lat, c.teleport.lon], {
+        radius: 4,
+        color: '#d29922',
+        fillColor: '#d29922',
+        fillOpacity: 1,
+        weight: 2,
+      }).addTo(map).bindTooltip('Teleport', {
+        permanent: false,
+        direction: 'top',
+      });
+      geoCircles.push(tpMarker);
+
+      const uplinkLine = L.polyline(
+        [[c.teleport.lat, c.teleport.lon], [c.satellite.lat, c.satellite.lon]],
+        { color: '#d29922', weight: 1, dashArray: '4,4', opacity: 0.5 }
+      ).addTo(map);
+      geoCircles.push(uplinkLine);
+    }
+
+    let details = `
+      <div style="border-left: 3px solid ${color}; padding-left: 8px; margin-bottom: 8px;">
+        <b>${c.name}</b> (NORAD ${c.norad_id})<br>
+        Measured RTT: ${c.measured_rtt_ms} ms &nbsp;
+        Ground delay: ${c.ground_delay_ms} ms &nbsp;
+        Sat leg RTT: ${c.satellite_leg_rtt_ms} ms<br>
+        One-way through sat: ${c.one_way_through_sat_ms.toFixed(1)} ms (${c.one_way_through_sat_km.toLocaleString()} km)<br>`;
+    if (c.teleport) {
+      details += `Teleport → Sat (uplink): ${c.teleport.uplink_range_km.toLocaleString()} km / ${c.teleport.uplink_delay_ms.toFixed(1)} ms<br>`;
+    }
+    details += `<b>Ship slant range: ${c.ship_slant_range_km.toLocaleString()} km</b> &nbsp;
+        Ship one-way: ${c.ship_one_way_delay_ms.toFixed(3)} ms`;
+    if (!c.teleport) {
+      details += `<br><span style="color:#d29922;">No teleport location — range includes uplink path. Add teleport coords for accurate circle.</span>`;
+    }
+    details += `</div>`;
+    html += details;
+  });
+
+  // If multiple circles, find approximate intersection area
+  if (circles.filter(c => !c.error).length > 1) {
+    html += `<div style="color:#d2a8ff; margin-top: 4px;">Multiple circles drawn — ship location is near their intersection.</div>`;
+  }
+
+  resultDiv.innerHTML = html;
+  resultDiv.classList.add('visible');
+
+  // Fit map to show all circles
+  if (geoCircles.length > 0) {
+    const group = L.featureGroup(geoCircles);
+    map.fitBounds(group.getBounds().pad(0.1));
+  }
+}
+
+function clearGeolocate() {
+  geoCircles.forEach(l => map.removeLayer(l));
+  geoCircles = [];
+  document.getElementById('geoResult').classList.remove('visible');
+  document.getElementById('geoResult').innerHTML = '';
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 loadProviders();
-loadFleet().then(startRefresh);
+loadFleet().then(() => {
+  startRefresh();
+  initGeoSelects();
+});
 </script>
 </body>
 </html>

@@ -534,6 +534,12 @@
       <input type="number" id="trackTpLon" value="22.56" step="0.01">
     </div>
   </div>
+  <div style="margin-top:8px;">
+    <label style="font-size:12px;color:#c9d1d9;cursor:pointer;">
+      <input type="checkbox" id="trackAutoCalibrate" checked style="accent-color:#58a6ff;">
+      Auto-calibrate (measure ground delay + find best gateway before tracking)
+    </label>
+  </div>
   <div class="tracker-buttons">
     <button class="btn-primary" id="trackStartBtn" onclick="startTracking()">Start Tracking</button>
     <button class="btn-danger" id="trackStopBtn" onclick="stopTracking()" style="display:none;">Stop</button>
@@ -1270,12 +1276,13 @@ async function startTracking() {
 
   const req = {
     ip: ip,
-    interval_sec: parseInt(document.getElementById('trackInterval').value) || 60,
+    interval_sec: parseInt(document.getElementById('trackInterval').value) || 1800,
     n_rounds: parseInt(document.getElementById('trackRounds').value) || 6,
-    pings_per_round: parseInt(document.getElementById('trackPings').value) || 20,
+    pings_per_round: parseInt(document.getElementById('trackPings').value) || 50,
     ground_delay_ms: parseFloat(document.getElementById('trackGround').value) || 5,
-    teleport_lat: parseFloat(document.getElementById('trackTpLat').value) || 49.68,
-    teleport_lon: parseFloat(document.getElementById('trackTpLon').value) || 6.33,
+    teleport_lat: parseFloat(document.getElementById('trackTpLat').value) || 38.90,
+    teleport_lon: parseFloat(document.getElementById('trackTpLon').value) || 22.56,
+    auto_calibrate: document.getElementById('trackAutoCalibrate').checked,
   };
 
   try {
@@ -1366,6 +1373,13 @@ function updateTrackingUI(data) {
   // Status text
   let statusHTML = `<span style="color:#58a6ff;">${data.status}</span>`;
   statusHTML += ` — ${completed}/${nRounds} rounds | IP: ${data.ip}`;
+  if (data.calibration) {
+    const cal = data.calibration;
+    statusHTML += `<br><span style="color:#d2a8ff;font-size:11px;">Calibrated: ${cal.gateway_label || cal.gateway} | Ground delay: ${cal.ground_delay_ms}ms</span>`;
+  }
+  if (data.teleport) {
+    statusHTML += `<br><span style="color:#8b949e;font-size:11px;">Teleport: ${data.teleport.lat}°, ${data.teleport.lon}° | Ground delay: ${data.ground_delay_ms}ms</span>`;
+  }
   document.getElementById('trackerStatusText').innerHTML = statusHTML;
 
   // Round entries

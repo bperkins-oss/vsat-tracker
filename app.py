@@ -571,9 +571,70 @@ def _compute_confidence_region(circles_data: list) -> dict | None:
 def _tracking_worker(track_id: str, ip: str, interval_sec: int,
                      n_rounds: int, pings_per_round: int,
                      ground_delay_ms: float, teleport_lat: float,
-                     teleport_lon: float):
+                     teleport_lon: float, auto_calibrate: bool = False):
     """Background thread that pings a ship periodically and updates tracking session."""
     session = tracking_sessions[track_id]
+
+    # Auto-calibrate if requested
+    if auto_calibrate:
+        session["status"] = "Calibrating — measuring ground delay and testing gateways..."
+        ground_data = _measure_ground_delay(ip, 5)
+        cal_ground = ground_data.get("estimated_ground_delay_ms", ground_delay_ms)
+
+        # Quick ping for RTT
+        quick_ping = _ping_host(ip, 10)
+        if "error" not in quick_ping:
+            cal_rtt = quick_ping["min_ms"]
+            sat_leg = cal_rtt - cal_ground
+            if sat_leg > 0:
+                ow_km = (sat_leg / 2) / 1000 * C_KM_S
+                now = datetime.now(timezone.utc)
+                o3b_sats = _find_best_o3b(now)
+
+                # Test all gateways, find valid ones
+                best_gw = None
+                best_ship_range = float("inf")
+                for gw_key, gw in O3B_GATEWAYS.items():
+                    best_elev = -90
+                    best_sat_for_gw = None
+                    for sat in o3b_sats:
+                        rng = compute_slant_range(
+                            gw["lat"], gw["lon"], 0.0,
+                            sat["lat_deg"], sat["lon_deg"], sat["alt_km"],
+                        )
+                        if rng["elevation_deg"] > best_elev:
+                            best_elev = rng["elevation_deg"]
+                            best_sat_for_gw = (sat, rng)
+                    if best_sat_for_gw and best_elev >= 5:
+                        sat, rng = best_sat_for_gw
+                        ship_range = ow_km - rng["slant_range_km"]
+                        if ship_range >= sat["alt_km"] and ship_range < best_ship_range:
+                            best_ship_range = ship_range
+                            best_gw = (gw_key, gw, sat)
+
+                if best_gw:
+                    gw_key, gw, sat = best_gw
+                    teleport_lat = gw["lat"]
+                    teleport_lon = gw["lon"]
+                    ground_delay_ms = cal_ground
+                    session["calibration"] = {
+                        "gateway": gw_key,
+                        "gateway_label": gw["label"],
+                        "ground_delay_ms": round(cal_ground, 2),
+                        "ground_data": ground_data,
+                    }
+                    session["teleport"] = {"lat": teleport_lat, "lon": teleport_lon}
+                    session["ground_delay_ms"] = ground_delay_ms
+                else:
+                    # No valid gateway found — use measured ground delay with original gateway
+                    ground_delay_ms = cal_ground
+                    session["calibration"] = {
+                        "gateway": "original",
+                        "ground_delay_ms": round(cal_ground, 2),
+                        "note": "No unclamped gateway found — using calibrated ground delay only",
+                        "ground_data": ground_data,
+                    }
+                    session["ground_delay_ms"] = ground_delay_ms
 
     for round_num in range(n_rounds):
         if session.get("stopped"):
@@ -727,14 +788,181 @@ def o3b_gateways():
     return O3B_GATEWAYS
 
 
+def _measure_ground_delay(ip: str, count: int = 10) -> dict:
+    """
+    Measure ground delay by pinging with increasing TTL to find the last
+    ground hop before the satellite jump. Returns estimated ground RTT.
+    """
+    # First get the baseline RTT to the target
+    base_ping = _ping_host(ip, count)
+    if "error" in base_ping:
+        return {"error": base_ping["error"]}
+
+    base_rtt = base_ping["min_ms"]
+
+    # Probe with increasing TTL to find the last ground hop
+    last_ground_rtt = 0
+    last_ground_hop = None
+    hops = []
+
+    for ttl in range(1, 25):
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "2", "-t", str(ttl), ip],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Check if we reached the target
+            rtt_match = re.search(r"time=([0-9.]+)", result.stdout)
+            exceeded = re.search(r"From ([0-9.]+)", result.stdout)
+
+            if rtt_match:
+                # Reached destination
+                hops.append({
+                    "ttl": ttl, "ip": ip, "rtt_ms": float(rtt_match.group(1)),
+                    "type": "destination"
+                })
+                break
+            elif exceeded:
+                hop_ip = exceeded.group(1)
+                # Ping this hop directly to get its RTT
+                hop_result = subprocess.run(
+                    ["ping", "-c", "3", "-W", "2", hop_ip],
+                    capture_output=True, text=True, timeout=10,
+                )
+                hop_rtt_match = re.search(
+                    r"min/avg/max.*?= ([0-9.]+)", hop_result.stdout
+                )
+                hop_rtt = float(hop_rtt_match.group(1)) if hop_rtt_match else None
+
+                hops.append({
+                    "ttl": ttl, "ip": hop_ip, "rtt_ms": hop_rtt,
+                    "type": "hop"
+                })
+
+                # This is a ground hop if RTT is much less than target RTT
+                if hop_rtt and hop_rtt < base_rtt * 0.5:
+                    last_ground_rtt = hop_rtt
+                    last_ground_hop = hop_ip
+            else:
+                hops.append({"ttl": ttl, "ip": "*", "rtt_ms": None, "type": "timeout"})
+        except Exception:
+            hops.append({"ttl": ttl, "ip": "*", "rtt_ms": None, "type": "error"})
+
+    # The ground delay is the RTT to the last hop before the satellite jump
+    # Cap it at (base_rtt - min_theoretical_satellite_rtt)
+    # For O3b at ~8062km altitude: min sat RTT = 2 * 2 * 8062 / 299792 * 1000 ≈ 107.6ms
+    min_sat_rtt_ms = 107.6
+    max_ground_delay = max(0, base_rtt - min_sat_rtt_ms)
+
+    estimated_ground_delay = min(last_ground_rtt, max_ground_delay) if last_ground_rtt else max_ground_delay
+
+    return {
+        "base_rtt_ms": round(base_rtt, 2),
+        "last_ground_hop": last_ground_hop,
+        "last_ground_hop_rtt_ms": round(last_ground_rtt, 2) if last_ground_rtt else None,
+        "max_ground_delay_ms": round(max_ground_delay, 2),
+        "estimated_ground_delay_ms": round(estimated_ground_delay, 2),
+        "hops": hops,
+    }
+
+
+@app.get("/api/calibrate")
+def calibrate(ip: str = Query(...), pings: int = Query(20)):
+    """
+    Auto-calibrate gateway + ground delay for a ship IP.
+    Pings the ship, measures ground delay via TTL probing, then tests
+    all known O3b gateways to find which one produces valid (unclamped)
+    ship ranges. Returns ranked results.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Step 1: Ping for baseline RTT
+    ping_result = _ping_host(ip, pings)
+    if "error" in ping_result:
+        return JSONResponse(status_code=400, content={"error": f"Cannot ping {ip}: {ping_result['error']}"})
+
+    min_rtt = ping_result["min_ms"]
+
+    # Step 2: Measure ground delay
+    ground_data = _measure_ground_delay(ip, 5)
+    ground_delay = ground_data.get("estimated_ground_delay_ms", 5.0)
+
+    # Step 3: Find all O3b satellites at current time
+    o3b_sats = _find_best_o3b(now)
+
+    # Step 4: Test each gateway
+    sat_leg_rtt = min_rtt - ground_delay
+    if sat_leg_rtt <= 0:
+        # Ground delay too high — fall back to theoretical max
+        ground_delay = ground_data.get("max_ground_delay_ms", 5.0)
+        sat_leg_rtt = min_rtt - ground_delay
+
+    one_way_km = (sat_leg_rtt / 2) / 1000 * C_KM_S
+
+    results = []
+    for gw_key, gw in O3B_GATEWAYS.items():
+        # Find best satellite for this gateway (highest elevation)
+        best_sat = None
+        best_elev = -90
+        for sat in o3b_sats:
+            rng = compute_slant_range(
+                gw["lat"], gw["lon"], 0.0,
+                sat["lat_deg"], sat["lon_deg"], sat["alt_km"],
+            )
+            if rng["elevation_deg"] > best_elev:
+                best_elev = rng["elevation_deg"]
+                best_sat = (sat, rng)
+
+        if not best_sat or best_elev < 5:
+            continue
+
+        sat, rng = best_sat
+        uplink_km = rng["slant_range_km"]
+        ship_range = one_way_km - uplink_km
+        clamped = ship_range < sat["alt_km"]
+
+        results.append({
+            "gateway": gw_key,
+            "gateway_label": gw["label"],
+            "gateway_lat": gw["lat"],
+            "gateway_lon": gw["lon"],
+            "satellite": sat["name"],
+            "satellite_norad": sat["norad_id"],
+            "sat_lat": round(sat["lat_deg"], 3),
+            "sat_lon": round(sat["lon_deg"], 3),
+            "sat_alt_km": round(sat["alt_km"], 1),
+            "elevation_deg": round(best_elev, 1),
+            "uplink_km": round(uplink_km, 1),
+            "ship_range_km": round(max(ship_range, sat["alt_km"]), 1),
+            "clamped": clamped,
+            "valid": not clamped,
+        })
+
+    # Sort: valid (unclamped) first, then by smallest ship range (closest to nadir)
+    results.sort(key=lambda r: (not r["valid"], r["ship_range_km"]))
+
+    return {
+        "ip": ip,
+        "ping": ping_result,
+        "ground_delay": ground_data,
+        "satellite_leg_rtt_ms": round(sat_leg_rtt, 2),
+        "one_way_through_sat_km": round(one_way_km, 1),
+        "gateways_tested": len(results),
+        "valid_gateways": len([r for r in results if r["valid"]]),
+        "results": results,
+        "recommended": results[0] if results else None,
+    }
+
+
 class TrackRequest(BaseModel):
     ip: str
     interval_sec: int = 1800        # 30 minutes default
     n_rounds: int = 6               # 6 rounds = 3 hours at 30min intervals
-    pings_per_round: int = 20       # 20 pings per round for stable min RTT
-    ground_delay_ms: float = 5.0    # minimal ground delay
+    pings_per_round: int = 50       # 50 pings per round for stable min RTT
+    ground_delay_ms: float = 5.0    # overridden by calibration
     teleport_lat: float = 38.90     # Thermopylae, Greece (O3b gateway)
     teleport_lon: float = 22.56
+    auto_calibrate: bool = False    # auto-detect gateway + ground delay
 
 
 @app.post("/api/track")
@@ -761,7 +989,7 @@ def start_tracking(req: TrackRequest):
         target=_tracking_worker,
         args=(track_id, req.ip, req.interval_sec, req.n_rounds,
               req.pings_per_round, req.ground_delay_ms,
-              req.teleport_lat, req.teleport_lon),
+              req.teleport_lat, req.teleport_lon, req.auto_calibrate),
         daemon=True,
     )
     thread.start()
@@ -806,6 +1034,9 @@ def get_tracking(track_id: str):
         "measurements": measurements_summary,
         "circles": circles_full,
         "confidence": session.get("confidence"),
+        "calibration": session.get("calibration"),
+        "ground_delay_ms": session.get("ground_delay_ms"),
+        "teleport": session.get("teleport"),
     }
 
 

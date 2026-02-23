@@ -392,6 +392,7 @@
     <button class="btn-primary" onclick="runGeolocate()">Draw Circles</button>
     <button class="btn-secondary" onclick="addPingRow()">+ Add Ping</button>
     <button class="btn-danger" onclick="clearGeolocate()">Clear</button>
+    <button class="btn-secondary" onclick="loadDemo()" style="margin-left:auto;">Load Live Ping Data</button>
   </div>
   <div class="geo-result" id="geoResult"></div>
 </div>
@@ -948,6 +949,121 @@ function clearGeolocate() {
   `;
   rows.appendChild(row);
   populateSatSelect(row.querySelector('.ping-sat'));
+}
+
+// ---------------------------------------------------------------------------
+// Demo — load real ping results from VSAT terminal scanning
+// ---------------------------------------------------------------------------
+const DEMO_PINGS = [
+  { label: 'Thuraya Ship (188.38.58.90)', norad_id: 62483, rtt_ms: 558, ground_delay_ms: 10,
+    teleport_lat: 24.2, teleport_lon: 55.7, ip: '188.38.58.90', provider: 'Thuraya' },
+  { label: 'Speedcast Ship (72.2.234.197)', norad_id: 38098, rtt_ms: 615, ground_delay_ms: 10,
+    teleport_lat: -31.9, teleport_lon: 115.9, ip: '72.2.234.197', provider: 'Speedcast' },
+  { label: 'Marlink Ship (217.168.183.72)', norad_id: 39172, rtt_ms: 484, ground_delay_ms: 10,
+    teleport_lat: 37.9, teleport_lon: 23.7, ip: '217.168.183.72', provider: 'Marlink' },
+  { label: 'Castor Marine Ship 1 (185.6.111.132)', norad_id: 43231, rtt_ms: 114, ground_delay_ms: 5,
+    teleport_lat: 49.68, teleport_lon: 6.33, ip: '185.6.111.132', provider: 'Castor/O3b' },
+  { label: 'Castor Marine Ship 2 (185.6.111.140)', norad_id: 40079, rtt_ms: 121, ground_delay_ms: 5,
+    teleport_lat: 49.68, teleport_lon: 6.33, ip: '185.6.111.140', provider: 'Castor/O3b' },
+  { label: 'Castor Marine Ship 3 (185.6.111.224)', norad_id: 58346, rtt_ms: 124, ground_delay_ms: 5,
+    teleport_lat: 49.68, teleport_lon: 6.33, ip: '185.6.111.224', provider: 'Castor/O3b' },
+];
+
+async function loadDemo() {
+  clearGeolocate();
+
+  const pings = DEMO_PINGS.map(p => ({
+    norad_id: p.norad_id,
+    rtt_ms: p.rtt_ms,
+    ground_delay_ms: p.ground_delay_ms,
+    teleport_lat: p.teleport_lat,
+    teleport_lon: p.teleport_lon,
+  }));
+
+  try {
+    const resp = await fetch('/api/geolocate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pings }),
+    });
+    const data = await resp.json();
+
+    // Enhance results with IP/provider info
+    data.circles.forEach((c, i) => {
+      if (!c.error) {
+        c._label = DEMO_PINGS[i].label;
+        c._ip = DEMO_PINGS[i].ip;
+        c._provider = DEMO_PINGS[i].provider;
+      }
+    });
+
+    drawGeoCirclesDemo(data.circles);
+  } catch(e) {
+    console.error('Demo failed:', e);
+  }
+}
+
+function drawGeoCirclesDemo(circles) {
+  geoCircles.forEach(l => map.removeLayer(l));
+  geoCircles = [];
+
+  const resultDiv = document.getElementById('geoResult');
+  let html = '<div style="margin-bottom:8px;color:#f0f6fc;font-weight:600;">Live Ping Geolocation — 6 VSAT ships pinged from this machine</div>';
+
+  circles.forEach((c, i) => {
+    if (c.error) {
+      html += `<div style="color:#f85149">Ping ${i+1}: ${c.error}</div>`;
+      return;
+    }
+
+    const color = circleColors[i % circleColors.length];
+    const label = c._label || c.name;
+    const ip = c._ip || '';
+    const prov = c._provider || '';
+
+    // Draw the range circle
+    const latlngs = c.circle.map(p => [p[0], p[1]]);
+    const poly = L.polyline(latlngs, {
+      color: color, weight: 2.5, opacity: 0.85,
+    }).addTo(map);
+    geoCircles.push(poly);
+
+    // Satellite marker
+    const satMarker = L.circleMarker([c.satellite.lat, c.satellite.lon], {
+      radius: 5, color: color, fillColor: color, fillOpacity: 1, weight: 2,
+    }).addTo(map).bindTooltip(c.name, { direction: 'top' });
+    geoCircles.push(satMarker);
+
+    // Teleport marker + line
+    if (c.teleport) {
+      const tpMarker = L.circleMarker([c.teleport.lat, c.teleport.lon], {
+        radius: 4, color: '#d29922', fillColor: '#d29922', fillOpacity: 1, weight: 2,
+      }).addTo(map).bindTooltip('Teleport', { direction: 'top' });
+      geoCircles.push(tpMarker);
+      const uplinkLine = L.polyline(
+        [[c.teleport.lat, c.teleport.lon], [c.satellite.lat, c.satellite.lon]],
+        { color: '#d29922', weight: 1, dashArray: '4,4', opacity: 0.4 }
+      ).addTo(map);
+      geoCircles.push(uplinkLine);
+    }
+
+    const warn = c.warning ? `<br><span style="color:#d29922;font-size:11px;">${c.warning}</span>` : '';
+    html += `
+      <div style="border-left: 3px solid ${color}; padding-left: 8px; margin-bottom: 8px;">
+        <b style="color:${color}">${prov}</b> — ${ip}<br>
+        Satellite: ${c.name} | RTT: ${c.measured_rtt_ms}ms | Ground: ${c.ground_delay_ms}ms<br>
+        Ship range: <b>${c.ship_slant_range_km.toLocaleString()} km</b> |
+        One-way: ${c.ship_one_way_delay_ms.toFixed(1)}ms${warn}
+      </div>`;
+  });
+
+  resultDiv.innerHTML = html;
+  resultDiv.classList.add('visible');
+
+  if (geoCircles.length > 0) {
+    const group = L.featureGroup(geoCircles);
+    map.fitBounds(group.getBounds().pad(0.1));
+  }
 }
 
 // ---------------------------------------------------------------------------
